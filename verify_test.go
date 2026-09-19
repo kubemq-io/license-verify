@@ -266,6 +266,17 @@ func TestVerifyRevocation(t *testing.T) {
 			want: licenseverify.ErrNotRevocation,
 		},
 		{
+			name: "assertion carrying lease claims (contract §1.5 exclusivity)",
+			token: func(t *testing.T) string {
+				c := testsign.RevocationClaims(fixedNow, jti, nonce)
+				c.Mode = licenseverify.ModeOnline
+				c.Plan = "pro"
+				return s.Sign(t, c)
+			},
+			jti: jti, nonce: nonce, now: fixedNow,
+			want: licenseverify.ErrAssertionClaims,
+		},
+		{
 			name:  "jti mismatch",
 			token: func(t *testing.T) string { return s.Sign(t, testsign.RevocationClaims(fixedNow, "other-id", nonce)) },
 			jti:   jti, nonce: nonce, now: fixedNow,

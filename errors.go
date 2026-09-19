@@ -59,6 +59,8 @@ var (
 
 	// ErrNotRevocation: the token is not a revocation assertion (`kmq.revoked` != true).
 	ErrNotRevocation = errors.New("licenseverify: not a revocation assertion")
+	// ErrAssertionClaims: a revocation assertion carries lease or file claims (contract §1.5).
+	ErrAssertionClaims = errors.New("licenseverify: revocation assertion carries entitlement claims")
 	// ErrJTIMismatch: the assertion's `jti` is not the expected license id.
 	ErrJTIMismatch = errors.New("licenseverify: jti mismatch")
 	// ErrNonceMismatch: the assertion's `kmq.nonce` does not echo the request nonce.

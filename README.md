@@ -175,3 +175,8 @@ go test -race ./...
 ## License
 
 Apache-2.0 — see `LICENSE`.
+
+
+### Assertion exclusivity (v0.1.2)
+
+`VerifyRevocation` rejects an assertion that carries any lease or file claim (`kmq.mode`, `kmq.plan`, `kmq.license_exp`, `kmq.max_instances`, `kmq.grace_days`, `kmq.token_version`, `kmq.fingerprint`, `kmq.fingerprints`, `kmq.over_cap`, `kmq.silent`) with `ErrAssertionClaims` (contract §1.5).

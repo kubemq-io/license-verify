@@ -246,6 +246,13 @@ func VerifyRevocation(token string, bundle *TrustBundle, opts VerifyOptions, exp
 	if !claims.Revoked {
 		return nil, ErrNotRevocation
 	}
+	// Contract §1.5: an assertion carries no entitlement claims. A token that
+	// mixes lease/file claims with kmq.revoked is malformed, never a confirmation.
+	if claims.Mode != "" || claims.Plan != "" || claims.LicenseExp != 0 || claims.MaxInstances != 0 ||
+		claims.GraceDays != 0 || claims.TokenVersion != 0 || claims.Fingerprint != "" ||
+		len(claims.Fingerprints) != 0 || claims.OverCap || claims.Silent {
+		return nil, ErrAssertionClaims
+	}
 	if expectedJTI == "" || claims.JTI != expectedJTI {
 		return nil, ErrJTIMismatch
 	}
