@@ -152,6 +152,26 @@ func BaseClaims(now time.Time) licenseverify.Claims {
 	}
 }
 
+// OfflineClaims returns a valid offline file issued at now, bound to two
+// installations, expiring in 365 days.
+func OfflineClaims(now time.Time) licenseverify.Claims {
+	return licenseverify.Claims{
+		JTI:          "a2b4c6d8-1e3f-4a5b-8c7d-9e0f1a2b3c4d",
+		Issuer:       licenseverify.Issuer,
+		Audience:     licenseverify.Audience,
+		Subject:      "Globex Industries",
+		IssuedAt:     now.Unix(),
+		NotBefore:    now.Unix(),
+		ExpiresAt:    now.Add(365 * 24 * time.Hour).Unix(),
+		Plan:         "enterprise",
+		Mode:         licenseverify.ModeOffline,
+		LicenseExp:   now.Add(365 * 24 * time.Hour).Unix(),
+		MaxInstances: 10,
+		Fingerprints: []string{"fp-1", "fp-2"},
+		TokenVersion: 1,
+	}
+}
+
 // RevocationClaims returns a valid revocation assertion for jti/nonce at now.
 func RevocationClaims(now time.Time, jti, nonce string) licenseverify.Claims {
 	return licenseverify.Claims{

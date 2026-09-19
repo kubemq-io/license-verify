@@ -19,14 +19,39 @@ revocation windows is a v2 and requires a coordinated release of every client.
 
 - Compact JWS, **ES256 only**. The header `alg` is checked before any claim is
   parsed; `none`, `RS*`, `HS*`, `PS*`, `ES384/512` fail with `ErrAlgorithm`.
+- **Closed header.** The protected header is exactly `{alg, kid, typ}`. Any
+  other member — `jwk`, `jku`, `x5u`, `x5c`, `cty`, anything — fails with
+  `ErrHeader` before the payload is decoded; `crit` fails with `ErrCritHeader`.
+  `typ` is **required** and must be exactly `JWT` (`ErrHeader`).
 - Header `kid` is **required** and must name a key in the caller's
-  `TrustBundle` (`ErrMissingKid`, `ErrUnknownKid`). A `crit` header is rejected.
-- `exp` is **required** (`ErrMissingExp`).
+  `TrustBundle` (`ErrMissingKid`, `ErrUnknownKid`).
+- `exp` and `iat` are **required** (`ErrMissingExp`, `ErrMissingIat`).
 - `iss` must equal `https://license.kubemq.io` (`Issuer`); `aud` must equal
   `kubemq-server` (`Audience`).
-- 5-minute leeway on `nbf` and `exp`.
+- 5-minute (300 s) leeway: `exp` may be up to 300 s in the past, `nbf` up to
+  300 s in the future (`ErrExpired`, `ErrNotYetValid`). `iat` may not be more
+  than 300 s in the future (`ErrIssuedInFuture`); an old `iat` is fine.
+- `nbf` is **required** on leases and offline files (`ErrMissingNbf`, enforced
+  by `VerifyLease` / `VerifyOffline`); revocation assertions carry none.
 - No labels map, no label-based expiry, no legacy `kid`, no file-level
   deactivation marker.
+
+### Token kinds
+
+`Verify` is the generic entry: header, signature, `iss`/`aud`/`exp`/`iat`/`nbf`.
+Callers that know which kind they expect use the kind verifier, which adds the
+required / forbidden claim rules of contract §1.3:
+
+| Verifier | Adds | Failure |
+|---|---|---|
+| `VerifyLease` | `kmq.mode == "online"`, `kmq.fingerprint` non-empty, `kmq.fingerprints` absent or empty, `kmq.revoked` false, `nbf` present | `ErrNotLease`, `ErrMissingNbf` |
+| `VerifyOffline` | `kmq.mode == "offline"`, `kmq.fingerprint` empty, `kmq.revoked` false, `nbf` present (`kmq.fingerprints` may be empty = unbound) | `ErrNotOffline`, `ErrMissingNbf` |
+| `VerifyRevocation` | `kmq.revoked == true`, `jti` and `kmq.nonce` match, `iat` not older than 10 min (and, as everywhere, not more than 300 s in the future), `exp − iat ≤ 15 min` (compared in whole seconds, so no overflow) | see below |
+
+A lease handed to `VerifyOffline` fails, and vice versa; a revocation
+assertion handed to either fails. The server calls `VerifyLease` on activate /
+refresh responses and cached leases, `VerifyOffline` on `KUBEMQ_LICENSE_FILE`
+/ `KUBEMQ_LICENSE_DATA`, and `VerifyRevocation` on a refresh `403` body.
 
 ### Claims
 
@@ -56,7 +81,8 @@ nested `kmq` object.
 A JWS with the same `kid`, the license `jti`, `kmq.revoked = true`,
 `kmq.reason`, `iat`, `kmq.nonce` (echo of the client's request nonce) and
 `exp = iat + 15 min`. `VerifyRevocation` additionally requires the `jti` and
-nonce to match, `iat` within 10 minutes of now, and `exp − iat ≤ 15 minutes`,
+nonce to match, `iat` no more than 10 minutes in the past (and, like every
+token, no more than 300 s in the future), and `exp − iat ≤ 15 minutes`,
 so a captured assertion cannot be replayed.
 
 ### Offline file armor
@@ -93,9 +119,14 @@ if hex.EncodeToString(hash[:]) != "…expected sha256 of the DER SubjectPublicKe
 jws, err := licenseverify.Dearmor(fileBytes)
 if err != nil { /* not a KUBEMQ LICENSE file */ }
 
-claims, err := licenseverify.Verify(jws, bundle, licenseverify.VerifyOptions{})
-if err != nil { /* errors.Is(err, licenseverify.ErrExpired) etc. */ }
+claims, err := licenseverify.VerifyOffline(jws, bundle, licenseverify.VerifyOptions{})
+if err != nil { /* errors.Is(err, licenseverify.ErrExpired), ErrNotOffline, etc. */ }
 fmt.Println(claims.Plan, claims.Mode, claims.MaxInstances)
+
+// Lease from activate / refresh.
+lease, err := licenseverify.VerifyLease(leaseJWS, bundle, licenseverify.VerifyOptions{})
+if err != nil { /* errors.Is(err, licenseverify.ErrNotLease) etc. */ }
+if lease.Fingerprint != ownFingerprint { /* refuse: issued to another installation */ }
 
 // Revocation assertion received at refresh.
 _, err = licenseverify.VerifyRevocation(assertion, bundle, licenseverify.VerifyOptions{}, claims.JTI, requestNonce)
@@ -117,7 +148,12 @@ default.
   module contains a PEM private-key marker. Signing for tests lives in
   `internal/testsign`, which is not importable from outside the module.
 - **Strict decoding.** Unpadded base64url with strict trailing-bit checks;
-  JSON with trailing data rejected; signature must be exactly 64 bytes.
+  JSON with trailing data rejected; the header is decoded with unknown
+  members rejected (so a token can never smuggle its own key via `jwk` /
+  `jku` / `x5u` / `x5c`); signature must be exactly 64 bytes.
+- **Kind checks.** A revocation assertion can never be accepted as a lease or
+  a file and vice versa: use `VerifyLease` / `VerifyOffline`, not bare
+  `Verify`, wherever the kind is known.
 - Key rotation: publish the new public key here, ship it in client releases,
   then start signing with the new `kid`. Clients advertise their trusted kids
   to the backend, which refuses to sign with a kid a client does not list.

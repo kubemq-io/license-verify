@@ -12,6 +12,9 @@ var (
 	ErrAlgorithm = errors.New("licenseverify: unsupported algorithm (ES256 only)")
 	// ErrCritHeader: the header carries a `crit` member, which is never accepted.
 	ErrCritHeader = errors.New("licenseverify: crit header not supported")
+	// ErrHeader: the header carries a member other than alg/kid/typ (jwk, jku,
+	// x5u, x5c, …) or its `typ` is not "JWT".
+	ErrHeader = errors.New("licenseverify: invalid JOSE header")
 	// ErrMissingKid: the header has no `kid`.
 	ErrMissingKid = errors.New("licenseverify: missing kid header")
 	// ErrUnknownKid: the header `kid` is not in the trust bundle.
@@ -24,6 +27,16 @@ var (
 	ErrExpired = errors.New("licenseverify: token expired")
 	// ErrNotYetValid: `nbf` (minus leeway) is in the future.
 	ErrNotYetValid = errors.New("licenseverify: token not yet valid")
+	// ErrIssuedInFuture: `iat` (minus leeway) is in the future.
+	ErrIssuedInFuture = errors.New("licenseverify: token issued in the future")
+	// ErrMissingNbf: a lease or offline file has no `nbf`.
+	ErrMissingNbf = errors.New("licenseverify: missing nbf claim")
+	// ErrNotLease: the token is not an online lease (wrong kmq.mode, missing
+	// kmq.fingerprint, kmq.fingerprints present, or kmq.revoked set).
+	ErrNotLease = errors.New("licenseverify: not an online lease")
+	// ErrNotOffline: the token is not an offline license file (wrong kmq.mode,
+	// kmq.fingerprint present, or kmq.revoked set).
+	ErrNotOffline = errors.New("licenseverify: not an offline license file")
 	// ErrIssuer: `iss` is not Issuer.
 	ErrIssuer = errors.New("licenseverify: unexpected issuer")
 	// ErrAudience: `aud` is not Audience.
@@ -50,7 +63,7 @@ var (
 	ErrJTIMismatch = errors.New("licenseverify: jti mismatch")
 	// ErrNonceMismatch: the assertion's `kmq.nonce` does not echo the request nonce.
 	ErrNonceMismatch = errors.New("licenseverify: nonce mismatch")
-	// ErrMissingIat: the assertion has no `iat`.
+	// ErrMissingIat: the token has no `iat` (required for every kind).
 	ErrMissingIat = errors.New("licenseverify: missing iat claim")
 	// ErrStaleAssertion: the assertion's `iat` is more than 10 minutes from now.
 	ErrStaleAssertion = errors.New("licenseverify: assertion iat outside the 10-minute window")

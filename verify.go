@@ -53,18 +53,29 @@ func (o VerifyOptions) leeway() time.Duration {
 
 var b64 = base64.RawURLEncoding.Strict()
 
+// HeaderTyp is the only accepted JOSE `typ` header value.
+const HeaderTyp = "JWT"
+
+// header is the complete set of JOSE header members a token may carry
+// (contract §1.1). `crit` is listed only so it can be reported with its own
+// sentinel; every other member (jwk, jku, x5u, x5c, …) is unknown and rejected.
 type header struct {
 	Alg  string          `json:"alg"`
 	Kid  string          `json:"kid"`
+	Typ  string          `json:"typ"`
 	Crit json.RawMessage `json:"crit"`
 }
 
-// Verify checks a compact JWS and returns its claims.
+// Verify checks a compact JWS and returns its claims. It is the generic
+// entry point; VerifyLease, VerifyOffline and VerifyRevocation add the
+// per-kind claim rules on top of it.
 //
-// Order of checks: token shape → header `alg` (ES256 only, decided before any
-// claim is parsed) → no `crit` → `kid` present and in bundle → ES256 signature
-// → claims parse → `exp` present → `iss` → `aud` → `nbf`/`exp` against
-// opts.Now with leeway.
+// Order of checks: token shape → header decode (unknown members rejected) →
+// header `alg` (ES256 only, decided before any claim is parsed) → no `crit`
+// → `typ` == "JWT" → `kid` present and in bundle → ES256 signature → claims
+// parse → `exp` and `iat` present → `iss` → `aud` → `exp`/`nbf`/`iat`
+// against opts.Now with leeway (`iat` may not be more than leeway in the
+// future). `nbf` is optional here; the kind verifiers require it.
 func Verify(token string, bundle *TrustBundle, opts VerifyOptions) (*Claims, error) {
 	if bundle == nil || bundle.Len() == 0 {
 		return nil, ErrNoTrustBundle
@@ -77,15 +88,18 @@ func Verify(token string, bundle *TrustBundle, opts VerifyOptions) (*Claims, err
 	if err != nil {
 		return nil, fmt.Errorf("%w: header: %v", ErrMalformed, err)
 	}
-	var hdr header
-	if err := strictUnmarshal(rawHeader, &hdr); err != nil {
-		return nil, fmt.Errorf("%w: header: %v", ErrMalformed, err)
+	hdr, err := decodeHeader(rawHeader)
+	if err != nil {
+		return nil, err
 	}
 	if hdr.Alg != "ES256" {
 		return nil, fmt.Errorf("%w: alg=%q", ErrAlgorithm, hdr.Alg)
 	}
 	if len(hdr.Crit) != 0 && !bytes.Equal(hdr.Crit, []byte("null")) {
 		return nil, ErrCritHeader
+	}
+	if hdr.Typ != HeaderTyp {
+		return nil, fmt.Errorf("%w: typ=%q", ErrHeader, hdr.Typ)
 	}
 	if hdr.Kid == "" {
 		return nil, ErrMissingKid
@@ -113,6 +127,9 @@ func Verify(token string, bundle *TrustBundle, opts VerifyOptions) (*Claims, err
 	if _, has := present["exp"]; !has {
 		return nil, ErrMissingExp
 	}
+	if _, has := present["iat"]; !has {
+		return nil, ErrMissingIat
+	}
 	var claims Claims
 	if err := strictUnmarshal(rawPayload, &claims); err != nil {
 		return nil, fmt.Errorf("%w: payload: %v", ErrMalformed, err)
@@ -136,7 +153,82 @@ func Verify(token string, bundle *TrustBundle, opts VerifyOptions) (*Claims, err
 			return nil, fmt.Errorf("%w: nbf=%s now=%s", ErrNotYetValid, nbf.UTC().Format(time.RFC3339), now.UTC().Format(time.RFC3339))
 		}
 	}
+	iat := time.Unix(claims.IssuedAt, 0)
+	if now.Add(leeway).Before(iat) {
+		return nil, fmt.Errorf("%w: iat=%s now=%s", ErrIssuedInFuture, iat.UTC().Format(time.RFC3339), now.UTC().Format(time.RFC3339))
+	}
 	return &claims, nil
+}
+
+// headerMembers are the JOSE header members Verify understands. Anything
+// else is rejected before the payload is touched.
+var headerMembers = map[string]struct{}{"alg": {}, "kid": {}, "typ": {}, "crit": {}}
+
+// decodeHeader parses the protected header strictly: one JSON object, no
+// trailing data, no member outside headerMembers, members of the right type.
+func decodeHeader(raw []byte) (header, error) {
+	var members map[string]json.RawMessage
+	if err := strictUnmarshal(raw, &members); err != nil {
+		return header{}, fmt.Errorf("%w: header: %v", ErrMalformed, err)
+	}
+	for name := range members {
+		if _, ok := headerMembers[name]; !ok {
+			return header{}, fmt.Errorf("%w: unexpected member %q", ErrHeader, name)
+		}
+	}
+	var hdr header
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&hdr); err != nil {
+		return header{}, fmt.Errorf("%w: header: %v", ErrMalformed, err)
+	}
+	return hdr, nil
+}
+
+// VerifyLease verifies an online lease: a token that passes Verify and has
+// `kmq.mode == "online"`, a non-empty `kmq.fingerprint`, no
+// `kmq.fingerprints`, no `kmq.revoked`, and an `nbf`. A revocation assertion
+// or an offline file fails with ErrNotLease.
+func VerifyLease(token string, bundle *TrustBundle, opts VerifyOptions) (*Claims, error) {
+	claims, err := Verify(token, bundle, opts)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case claims.Revoked:
+		return nil, fmt.Errorf("%w: kmq.revoked is set", ErrNotLease)
+	case claims.Mode != ModeOnline:
+		return nil, fmt.Errorf("%w: kmq.mode=%q", ErrNotLease, claims.Mode)
+	case claims.Fingerprint == "":
+		return nil, fmt.Errorf("%w: kmq.fingerprint is empty", ErrNotLease)
+	case len(claims.Fingerprints) != 0:
+		return nil, fmt.Errorf("%w: kmq.fingerprints is present", ErrNotLease)
+	case claims.NotBefore == 0:
+		return nil, ErrMissingNbf
+	}
+	return claims, nil
+}
+
+// VerifyOffline verifies an offline license file: a token that passes Verify
+// and has `kmq.mode == "offline"`, an empty `kmq.fingerprint`, no
+// `kmq.revoked`, and an `nbf`. `kmq.fingerprints` may be empty (unbound). A
+// revocation assertion or an online lease fails with ErrNotOffline.
+func VerifyOffline(token string, bundle *TrustBundle, opts VerifyOptions) (*Claims, error) {
+	claims, err := Verify(token, bundle, opts)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case claims.Revoked:
+		return nil, fmt.Errorf("%w: kmq.revoked is set", ErrNotOffline)
+	case claims.Mode != ModeOffline:
+		return nil, fmt.Errorf("%w: kmq.mode=%q", ErrNotOffline, claims.Mode)
+	case claims.Fingerprint != "":
+		return nil, fmt.Errorf("%w: kmq.fingerprint is present", ErrNotOffline)
+	case claims.NotBefore == 0:
+		return nil, ErrMissingNbf
+	}
+	return claims, nil
 }
 
 // VerifyRevocation verifies a revocation assertion: a token that passes
@@ -168,8 +260,11 @@ func VerifyRevocation(token string, bundle *TrustBundle, opts VerifyOptions, exp
 	if d := now.Sub(iat); d > RevocationIatWindow || d < -RevocationIatWindow {
 		return nil, fmt.Errorf("%w: iat=%s now=%s", ErrStaleAssertion, iat.UTC().Format(time.RFC3339), now.UTC().Format(time.RFC3339))
 	}
-	if claims.ExpiresAt < claims.IssuedAt || time.Duration(claims.ExpiresAt-claims.IssuedAt)*time.Second > RevocationMaxLifetime {
-		return nil, fmt.Errorf("%w: exp-iat=%ds", ErrAssertionWindow, claims.ExpiresAt-claims.IssuedAt)
+	// Compare in seconds as int64: converting exp-iat to a time.Duration
+	// would overflow (and wrap to a small value) for exp-iat > ~292 years.
+	lifetime := claims.ExpiresAt - claims.IssuedAt
+	if claims.ExpiresAt < claims.IssuedAt || lifetime < 0 || lifetime > int64(RevocationMaxLifetime/time.Second) {
+		return nil, fmt.Errorf("%w: exp-iat=%ds", ErrAssertionWindow, lifetime)
 	}
 	return claims, nil
 }

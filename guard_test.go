@@ -48,17 +48,168 @@ func TestGuard_KidRequiredAndKnown(t *testing.T) {
 	bundle := s.Bundle(t)
 	base := testsign.BaseClaims(fixedNow)
 
-	_, err := licenseverify.Verify(s.SignHeader(t, map[string]any{"alg": "ES256"}, base), bundle, optsAt(fixedNow))
+	_, err := licenseverify.Verify(s.SignHeader(t, map[string]any{"alg": "ES256", "typ": "JWT"}, base), bundle, optsAt(fixedNow))
 	assert.ErrorIs(t, err, licenseverify.ErrMissingKid, "no kid")
 
-	_, err = licenseverify.Verify(s.SignHeader(t, map[string]any{"alg": "ES256", "kid": ""}, base), bundle, optsAt(fixedNow))
+	_, err = licenseverify.Verify(s.SignHeader(t, map[string]any{"alg": "ES256", "typ": "JWT", "kid": ""}, base), bundle, optsAt(fixedNow))
 	assert.ErrorIs(t, err, licenseverify.ErrMissingKid, "empty kid")
 
-	_, err = licenseverify.Verify(s.SignHeader(t, map[string]any{"alg": "ES256", "kid": "k2"}, base), bundle, optsAt(fixedNow))
+	_, err = licenseverify.Verify(s.SignHeader(t, map[string]any{"alg": "ES256", "typ": "JWT", "kid": "k2"}, base), bundle, optsAt(fixedNow))
 	assert.ErrorIs(t, err, licenseverify.ErrUnknownKid, "unknown kid")
 
-	_, err = licenseverify.Verify(s.SignHeader(t, map[string]any{"alg": "ES256", "kid": 7}, base), bundle, optsAt(fixedNow))
+	_, err = licenseverify.Verify(s.SignHeader(t, map[string]any{"alg": "ES256", "typ": "JWT", "kid": 7}, base), bundle, optsAt(fixedNow))
 	assert.ErrorIs(t, err, licenseverify.ErrMalformed, "non-string kid")
+}
+
+// TestGuard_HeaderIsClosed pins contract §1.1: the protected header is exactly
+// {alg, kid, typ}. Any other member — including the key-injection members
+// jwk / jku / x5u / x5c — is rejected before the payload is touched.
+func TestGuard_HeaderIsClosed(t *testing.T) {
+	s := testsign.New(t, "k1")
+	bundle := s.Bundle(t)
+	base := testsign.BaseClaims(fixedNow)
+	good := map[string]any{"alg": "ES256", "kid": "k1", "typ": "JWT"}
+
+	_, err := licenseverify.Verify(s.SignHeader(t, good, base), bundle, optsAt(fixedNow))
+	require.NoError(t, err, "the canonical header verifies")
+
+	extra := map[string]any{
+		"jwk": map[string]string{"kty": "EC", "crv": "P-256", "x": "AA", "y": "AA"},
+		"jku": "https://evil.example/keys",
+		"x5u": "https://evil.example/cert.pem",
+		"x5c": []string{"MIIB"},
+		"cty": "JWT",
+		"exp": 1,
+		"zip": "DEF",
+		"enc": "A256GCM",
+	}
+	for name, value := range extra {
+		t.Run("member "+name, func(t *testing.T) {
+			hdr := map[string]any{}
+			for k, v := range good {
+				hdr[k] = v
+			}
+			hdr[name] = value
+			_, err := licenseverify.Verify(s.SignHeader(t, hdr, base), bundle, optsAt(fixedNow))
+			assert.ErrorIs(t, err, licenseverify.ErrHeader)
+		})
+	}
+
+	typs := map[string]any{"missing": nil, "empty": "", "lowercase jwt": "jwt", "JOSE": "JOSE", "at+jwt": "at+jwt", "non-string": 1}
+	for name, value := range typs {
+		t.Run("typ "+name, func(t *testing.T) {
+			hdr := map[string]any{"alg": "ES256", "kid": "k1"}
+			if value != nil {
+				hdr["typ"] = value
+			}
+			_, err := licenseverify.Verify(s.SignHeader(t, hdr, base), bundle, optsAt(fixedNow))
+			if name == "non-string" {
+				assert.ErrorIs(t, err, licenseverify.ErrMalformed)
+				return
+			}
+			assert.ErrorIs(t, err, licenseverify.ErrHeader)
+		})
+	}
+
+	t.Run("crit keeps its own sentinel", func(t *testing.T) {
+		_, err := licenseverify.Verify(s.SignHeader(t, map[string]any{"alg": "ES256", "kid": "k1", "typ": "JWT", "crit": []string{"exp"}}, base), bundle, optsAt(fixedNow))
+		assert.ErrorIs(t, err, licenseverify.ErrCritHeader)
+	})
+	t.Run("alg is decided before typ", func(t *testing.T) {
+		_, err := licenseverify.Verify(s.SignHeader(t, map[string]any{"alg": "none", "kid": "k1"}, base), bundle, optsAt(fixedNow))
+		assert.ErrorIs(t, err, licenseverify.ErrAlgorithm)
+	})
+	t.Run("unknown member is decided before alg", func(t *testing.T) {
+		_, err := licenseverify.Verify(s.SignHeader(t, map[string]any{"alg": "none", "kid": "k1", "typ": "JWT", "jwk": "x"}, base), bundle, optsAt(fixedNow))
+		assert.ErrorIs(t, err, licenseverify.ErrHeader)
+	})
+}
+
+// TestGuard_IatRules pins contract §1.2: `iat` is required on every token and
+// may not be more than the leeway (300 s) in the future.
+func TestGuard_IatRules(t *testing.T) {
+	s := testsign.New(t, "k1")
+	bundle := s.Bundle(t)
+	base := testsign.BaseClaims(fixedNow)
+
+	m := testsign.ClaimsMap(t, base)
+	delete(m, "iat")
+	_, err := licenseverify.Verify(s.Sign(t, m), bundle, optsAt(fixedNow))
+	assert.ErrorIs(t, err, licenseverify.ErrMissingIat, "missing iat")
+
+	c := base
+	c.IssuedAt = fixedNow.Add(5*time.Minute + time.Second).Unix()
+	_, err = licenseverify.Verify(s.Sign(t, c), bundle, optsAt(fixedNow))
+	assert.ErrorIs(t, err, licenseverify.ErrIssuedInFuture, "iat 301 s in the future")
+
+	c.IssuedAt = fixedNow.Add(5 * time.Minute).Unix()
+	_, err = licenseverify.Verify(s.Sign(t, c), bundle, optsAt(fixedNow))
+	require.NoError(t, err, "iat exactly 300 s in the future is within leeway")
+
+	c.IssuedAt = fixedNow.Add(4 * time.Minute).Unix()
+	_, err = licenseverify.Verify(s.Sign(t, c), bundle, optsAt(fixedNow))
+	require.NoError(t, err, "iat 240 s in the future")
+
+	c.IssuedAt = fixedNow.Add(2 * time.Minute).Unix()
+	_, err = licenseverify.Verify(s.Sign(t, c), bundle, licenseverify.VerifyOptions{Now: func() time.Time { return fixedNow }, Leeway: time.Minute})
+	assert.ErrorIs(t, err, licenseverify.ErrIssuedInFuture, "custom leeway applies to iat")
+
+	c.IssuedAt = fixedNow.Add(-365 * 24 * time.Hour).Unix()
+	_, err = licenseverify.Verify(s.Sign(t, c), bundle, optsAt(fixedNow))
+	require.NoError(t, err, "an old iat is fine for Verify")
+}
+
+// TestGuard_NbfRequiredForLeaseAndOffline pins contract §1.3: `nbf` is
+// required on leases and offline files (not on assertions).
+func TestGuard_NbfRequiredForLeaseAndOffline(t *testing.T) {
+	s := testsign.New(t, "k1")
+	bundle := s.Bundle(t)
+
+	m := testsign.ClaimsMap(t, testsign.BaseClaims(fixedNow))
+	delete(m, "nbf")
+	tok := s.Sign(t, m)
+	_, err := licenseverify.Verify(tok, bundle, optsAt(fixedNow))
+	require.NoError(t, err, "generic Verify does not require nbf")
+	_, err = licenseverify.VerifyLease(tok, bundle, optsAt(fixedNow))
+	assert.ErrorIs(t, err, licenseverify.ErrMissingNbf)
+
+	m = testsign.ClaimsMap(t, testsign.OfflineClaims(fixedNow))
+	delete(m, "nbf")
+	_, err = licenseverify.VerifyOffline(s.Sign(t, m), bundle, optsAt(fixedNow))
+	assert.ErrorIs(t, err, licenseverify.ErrMissingNbf)
+
+	const jti = "3b6d1a2e-7f4c-4d3a-9c1e-1f2a3b4c5d6e"
+	_, err = licenseverify.VerifyRevocation(s.Sign(t, testsign.RevocationClaims(fixedNow, jti, "n")), bundle, optsAt(fixedNow), jti, "n")
+	require.NoError(t, err, "assertions carry no nbf and still verify")
+}
+
+// TestGuard_RevocationLifetimeOverflow: exp-iat of 18446744074 s (2^64/1e9,
+// rounded up) used to wrap to ~0.3 s when converted to a time.Duration and
+// slip under the 15-minute cap. The comparison now runs in int64 seconds.
+func TestGuard_RevocationLifetimeOverflow(t *testing.T) {
+	s := testsign.New(t, "k1")
+	bundle := s.Bundle(t)
+	const jti = "3b6d1a2e-7f4c-4d3a-9c1e-1f2a3b4c5d6e"
+
+	for _, lifetime := range []int64{18446744074, 18446744073, 9223372037, 1 << 62, 901} {
+		c := testsign.RevocationClaims(fixedNow, jti, "n")
+		c.ExpiresAt = c.IssuedAt + lifetime
+		_, err := licenseverify.VerifyRevocation(s.Sign(t, c), bundle, optsAt(fixedNow), jti, "n")
+		assert.ErrorIs(t, err, licenseverify.ErrAssertionWindow, "lifetime %d", lifetime)
+	}
+	c := testsign.RevocationClaims(fixedNow, jti, "n")
+	c.ExpiresAt = c.IssuedAt + 900
+	_, err := licenseverify.VerifyRevocation(s.Sign(t, c), bundle, optsAt(fixedNow), jti, "n")
+	require.NoError(t, err, "exactly 900 s is the contract lifetime")
+
+	// exp < iat cannot pass Verify (exp is in the past) but must never be
+	// reachable as a negative lifetime either: exp just inside leeway, iat
+	// after it.
+	c = testsign.RevocationClaims(fixedNow, jti, "n")
+	c.ExpiresAt = fixedNow.Add(-time.Minute).Unix()
+	c.IssuedAt = fixedNow.Unix()
+	_, err = licenseverify.VerifyRevocation(s.Sign(t, c), bundle, optsAt(fixedNow), jti, "n")
+	assert.ErrorIs(t, err, licenseverify.ErrAssertionWindow, "exp before iat")
 }
 
 func TestGuard_ExpIssAudRequired(t *testing.T) {

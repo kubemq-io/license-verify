@@ -16,8 +16,9 @@ const (
 // file, or revocation assertion). The JSON keys are flat: `kmq.plan` is a
 // top-level member named "kmq.plan", not a nested object.
 //
-// Times are unix seconds. A zero `iat`/`nbf` means the claim was absent;
-// `exp` is required by Verify, so a returned Claims always has a non-zero Exp.
+// Times are unix seconds. `exp` and `iat` are required by Verify, so a
+// returned Claims always has both. A zero `nbf` means the claim was absent;
+// VerifyLease and VerifyOffline require it, VerifyRevocation does not.
 type Claims struct {
 	JTI       string `json:"jti"`
 	Issuer    string `json:"iss"`

@@ -188,7 +188,7 @@ func TestVerify_Table(t *testing.T) {
 		{
 			name: "crit header rejected",
 			token: func(t *testing.T) string {
-				return s.SignHeader(t, map[string]any{"alg": "ES256", "kid": "k1", "crit": []string{"exp"}, "exp": 1}, base)
+				return s.SignHeader(t, map[string]any{"alg": "ES256", "kid": "k1", "typ": "JWT", "crit": []string{"exp"}}, base)
 			},
 			want: licenseverify.ErrCritHeader,
 		},
@@ -290,12 +290,19 @@ func TestVerifyRevocation(t *testing.T) {
 			want: licenseverify.ErrStaleAssertion,
 		},
 		{
-			name: "iat more than 10 minutes in the future",
+			name: "iat more than the 5-minute leeway in the future (rejected by Verify)",
 			token: func(t *testing.T) string {
-				return s.Sign(t, testsign.RevocationClaims(fixedNow.Add(11*time.Minute), jti, nonce))
+				return s.Sign(t, testsign.RevocationClaims(fixedNow.Add(6*time.Minute), jti, nonce))
 			},
 			jti: jti, nonce: nonce, now: fixedNow,
-			want: licenseverify.ErrStaleAssertion,
+			want: licenseverify.ErrIssuedInFuture,
+		},
+		{
+			name: "iat 4 minutes in the future is within leeway",
+			token: func(t *testing.T) string {
+				return s.Sign(t, testsign.RevocationClaims(fixedNow.Add(4*time.Minute), jti, nonce))
+			},
+			jti: jti, nonce: nonce, now: fixedNow,
 		},
 		{
 			name: "missing iat",
@@ -339,4 +346,153 @@ func TestVerifyRevocation(t *testing.T) {
 			assert.Nil(t, claims)
 		})
 	}
+}
+
+func TestVerifyLease(t *testing.T) {
+	s := testsign.New(t, "k1")
+	bundle := s.Bundle(t)
+	const jti = "3b6d1a2e-7f4c-4d3a-9c1e-1f2a3b4c5d6e"
+
+	tests := []struct {
+		name  string
+		token func(t *testing.T) string
+		want  error
+	}{
+		{"valid lease", func(t *testing.T) string { return s.Sign(t, testsign.BaseClaims(fixedNow)) }, nil},
+		{"offline file", func(t *testing.T) string { return s.Sign(t, testsign.OfflineClaims(fixedNow)) }, licenseverify.ErrNotLease},
+		{"revocation assertion", func(t *testing.T) string { return s.Sign(t, testsign.RevocationClaims(fixedNow, jti, "n")) }, licenseverify.ErrNotLease},
+		{"lease with kmq.revoked", func(t *testing.T) string { c := testsign.BaseClaims(fixedNow); c.Revoked = true; return s.Sign(t, c) }, licenseverify.ErrNotLease},
+		{"missing mode", func(t *testing.T) string { c := testsign.BaseClaims(fixedNow); c.Mode = ""; return s.Sign(t, c) }, licenseverify.ErrNotLease},
+		{"unknown mode", func(t *testing.T) string { c := testsign.BaseClaims(fixedNow); c.Mode = "hybrid"; return s.Sign(t, c) }, licenseverify.ErrNotLease},
+		{"uppercase mode", func(t *testing.T) string { c := testsign.BaseClaims(fixedNow); c.Mode = "Online"; return s.Sign(t, c) }, licenseverify.ErrNotLease},
+		{"empty fingerprint", func(t *testing.T) string { c := testsign.BaseClaims(fixedNow); c.Fingerprint = ""; return s.Sign(t, c) }, licenseverify.ErrNotLease},
+		{"fingerprints present", func(t *testing.T) string {
+			c := testsign.BaseClaims(fixedNow)
+			c.Fingerprints = []string{"fp-1"}
+			return s.Sign(t, c)
+		}, licenseverify.ErrNotLease},
+		{"fingerprints present as empty array passes", func(t *testing.T) string {
+			m := testsign.ClaimsMap(t, testsign.BaseClaims(fixedNow))
+			m["kmq.fingerprints"] = []string{}
+			return s.Sign(t, m)
+		}, nil},
+		{"missing nbf", func(t *testing.T) string {
+			m := testsign.ClaimsMap(t, testsign.BaseClaims(fixedNow))
+			delete(m, "nbf")
+			return s.Sign(t, m)
+		}, licenseverify.ErrMissingNbf},
+		{"expired lease fails in Verify first", func(t *testing.T) string {
+			return s.Sign(t, testsign.BaseClaims(fixedNow.Add(-8*24*time.Hour)))
+		}, licenseverify.ErrExpired},
+		{"bad signature fails in Verify first", func(t *testing.T) string {
+			return testsign.New(t, "k1").Sign(t, testsign.BaseClaims(fixedNow))
+		}, licenseverify.ErrSignature},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			claims, err := licenseverify.VerifyLease(tc.token(t), bundle, optsAt(fixedNow))
+			if tc.want == nil {
+				require.NoError(t, err)
+				assert.Equal(t, licenseverify.ModeOnline, claims.Mode)
+				assert.NotEmpty(t, claims.Fingerprint)
+				return
+			}
+			assert.ErrorIs(t, err, tc.want)
+			assert.Nil(t, claims)
+		})
+	}
+}
+
+func TestVerifyOffline(t *testing.T) {
+	s := testsign.New(t, "k1")
+	bundle := s.Bundle(t)
+	const jti = "3b6d1a2e-7f4c-4d3a-9c1e-1f2a3b4c5d6e"
+
+	tests := []struct {
+		name  string
+		token func(t *testing.T) string
+		want  error
+	}{
+		{"valid bound file", func(t *testing.T) string { return s.Sign(t, testsign.OfflineClaims(fixedNow)) }, nil},
+		{"valid unbound file (no fingerprints)", func(t *testing.T) string {
+			c := testsign.OfflineClaims(fixedNow)
+			c.Fingerprints = nil
+			return s.Sign(t, c)
+		}, nil},
+		{"valid unbound file (empty fingerprints array)", func(t *testing.T) string {
+			m := testsign.ClaimsMap(t, testsign.OfflineClaims(fixedNow))
+			m["kmq.fingerprints"] = []string{}
+			return s.Sign(t, m)
+		}, nil},
+		{"armored file after Dearmor", func(t *testing.T) string {
+			jws, err := licenseverify.Dearmor(licenseverify.Armor(s.Sign(t, testsign.OfflineClaims(fixedNow))))
+			require.NoError(t, err)
+			return jws
+		}, nil},
+		{"online lease", func(t *testing.T) string { return s.Sign(t, testsign.BaseClaims(fixedNow)) }, licenseverify.ErrNotOffline},
+		{"revocation assertion", func(t *testing.T) string { return s.Sign(t, testsign.RevocationClaims(fixedNow, jti, "n")) }, licenseverify.ErrNotOffline},
+		{"file with kmq.revoked", func(t *testing.T) string {
+			c := testsign.OfflineClaims(fixedNow)
+			c.Revoked = true
+			return s.Sign(t, c)
+		}, licenseverify.ErrNotOffline},
+		{"missing mode", func(t *testing.T) string { c := testsign.OfflineClaims(fixedNow); c.Mode = ""; return s.Sign(t, c) }, licenseverify.ErrNotOffline},
+		{"fingerprint present", func(t *testing.T) string {
+			c := testsign.OfflineClaims(fixedNow)
+			c.Fingerprint = "fp-1"
+			return s.Sign(t, c)
+		}, licenseverify.ErrNotOffline},
+		{"missing nbf", func(t *testing.T) string {
+			m := testsign.ClaimsMap(t, testsign.OfflineClaims(fixedNow))
+			delete(m, "nbf")
+			return s.Sign(t, m)
+		}, licenseverify.ErrMissingNbf},
+		{"expired file fails in Verify first", func(t *testing.T) string {
+			return s.Sign(t, testsign.OfflineClaims(fixedNow.Add(-2*365*24*time.Hour)))
+		}, licenseverify.ErrExpired},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			claims, err := licenseverify.VerifyOffline(tc.token(t), bundle, optsAt(fixedNow))
+			if tc.want == nil {
+				require.NoError(t, err)
+				assert.Equal(t, licenseverify.ModeOffline, claims.Mode)
+				assert.Empty(t, claims.Fingerprint)
+				return
+			}
+			assert.ErrorIs(t, err, tc.want)
+			assert.Nil(t, claims)
+		})
+	}
+}
+
+// TestVerifyKinds_CrossRejection: each kind verifier rejects the other two
+// kinds, and the generic Verify accepts all three.
+func TestVerifyKinds_CrossRejection(t *testing.T) {
+	s := testsign.New(t, "k1")
+	bundle := s.Bundle(t)
+	const jti = "3b6d1a2e-7f4c-4d3a-9c1e-1f2a3b4c5d6e"
+	lease := s.Sign(t, testsign.BaseClaims(fixedNow))
+	offline := s.Sign(t, testsign.OfflineClaims(fixedNow))
+	assertion := s.Sign(t, testsign.RevocationClaims(fixedNow, jti, "n"))
+
+	for name, tok := range map[string]string{"lease": lease, "offline": offline, "assertion": assertion} {
+		_, err := licenseverify.Verify(tok, bundle, optsAt(fixedNow))
+		require.NoError(t, err, "generic Verify accepts a %s", name)
+	}
+
+	_, err := licenseverify.VerifyLease(offline, bundle, optsAt(fixedNow))
+	assert.ErrorIs(t, err, licenseverify.ErrNotLease)
+	_, err = licenseverify.VerifyLease(assertion, bundle, optsAt(fixedNow))
+	assert.ErrorIs(t, err, licenseverify.ErrNotLease)
+
+	_, err = licenseverify.VerifyOffline(lease, bundle, optsAt(fixedNow))
+	assert.ErrorIs(t, err, licenseverify.ErrNotOffline)
+	_, err = licenseverify.VerifyOffline(assertion, bundle, optsAt(fixedNow))
+	assert.ErrorIs(t, err, licenseverify.ErrNotOffline)
+
+	_, err = licenseverify.VerifyRevocation(lease, bundle, optsAt(fixedNow), jti, "n")
+	assert.ErrorIs(t, err, licenseverify.ErrNotRevocation)
+	_, err = licenseverify.VerifyRevocation(offline, bundle, optsAt(fixedNow), jti, "n")
+	assert.ErrorIs(t, err, licenseverify.ErrNotRevocation)
 }
